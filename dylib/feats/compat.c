@@ -609,6 +609,8 @@ static void load_tool_list(void) {
     char path[512];
     snprintf(path, sizeof(path), "%s/Library/Application Support/notproton/tools", home);
     np_compat_load_tool_list(path, tools_dir);
+    snprintf(path, sizeof(path), "%s/Library/Application Support/notproton/runners", home);
+    np_compat_load_custom_runners(path, tools_dir);
     np_compat_adopt_tools(tools_dir);
 }
 
@@ -1170,3 +1172,6 @@ void *np_compat_registered_tool(void *compat_mgr) {
     }
     return NULL;
 }
+
+// steamplay-mac fork: custom Wine runners (runners/wine-<name>).
+#include "custom_runner.inc"

@@ -67,6 +67,8 @@ void np_compat_export_tools_path(void);
 // number of tools kept.
 int  np_compat_load_tool_list(const char *path, const char *tools_dir);
 int  np_compat_adopt_tools(const char *tools_dir);
+// Adds a tool for every runners/wine-<name>/runner.json (a custom Wine runner).
+int  np_compat_load_custom_runners(const char *runners_dir, const char *tools_dir);
 
 // Writes a directory for every tool in the app's list and removes the directories of tools
 // no longer in it.

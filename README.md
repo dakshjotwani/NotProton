@@ -46,3 +46,42 @@ As far as the source structure goes, the macOS app itself is located in the ```a
 steam-helper from Proton 9.0. ntdll-patch patches the copy of CrossOver that the app
 makes/places in the ```~/Library/Application Support/notproton/runners/``` folder so that
 lsteamclient is loaded.
+
+## Custom Wine runners (this fork)
+
+Besides the CrossOver builds the app sets up, `notproton.dylib` registers any Wine you put in
+`~/Library/Application Support/notproton/runners/wine-<name>/` as its own Steam compatibility
+tool, `notproton-wine-<name>`. The app does not manage these folders: it neither lists nor
+prunes them. Restart Steam after adding or removing one.
+
+A runner folder is a Wine install tree plus a `runner.json`:
+
+```
+runners/wine-<name>/
+  runner.json                      {"kind": "wine", "display_name": "...", "msync": true, "wine": "wine-11.0"}
+  bin/wineserver
+  lib/wine/x86_64-unix/wine        (and ntdll.so etc.; x86_64 Wine, run under Rosetta)
+  lib/wine/x86_64-windows/  lib/wine/i386-windows/
+  share/wine/wine.inf
+  lib/*.dylib                      optional: on DYLD_FALLBACK_LIBRARY_PATH for Wine's unix side
+  lib/renderers/{d3dmetal,d3dmetal4,dxmt,dxvk}/   optional DLL overlays, see below
+  lib/external/libd3dshared.dylib  optional: D3DMetal 3 (lib/external/d3dmetal4/ for 4)
+  lib/wine/*/lsteamclient.{dll,so}, share/steamplay/steam.exe   optional Steam bridge
+```
+
+- `display_name` is the name Steam shows (default `Wine (<name>)`). `"msync": true` turns
+  msync on by default, for a wineserver that has it.
+- Steam features need Wine's ntdll to route `steamclient(64).dll` to the builtin
+  `lsteamclient` (Valve's Proton patches). NotProton's binary ntdll patch is CrossOver only,
+  so a custom runner has to carry that in its source. When the runner ships its own
+  `lsteamclient` and `steam.exe`, those are staged into the prefix instead of the app's.
+- Graphics: `CX_GRAPHICS_BACKEND` (the panel's setting) picks `d3dmetal`, `d3dmetal4`, `dxmt`,
+  `dxvk` or `wined3d`; unset, the game's PE imports decide (Direct3D 12 → D3DMetal,
+  10/11 → DXMT, else wined3d, using the `pe-d3d` helper in the support folder). The chosen
+  renderer's folder goes in front through `WINEDLLPATH_PREPEND`, which the Wine needs to
+  support (Highball's `ntdll-winedllpath-prepend`). A renderer the runner lacks falls back to
+  wined3d.
+- Runner variants are CrossOver only and are ignored for a custom runner.
+
+[steamplay-mac](https://github.com/Drustburn/steamplay-mac) builds such a runner from the
+CrossOver 26.3 sources.

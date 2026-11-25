@@ -827,3 +827,6 @@ rebuild: clean all
 -include $(DEPS)
 
 FORCE:
+
+# steamplay-mac fork: its own build rules and checks.
+include fork.mk

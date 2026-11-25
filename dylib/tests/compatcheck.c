@@ -629,6 +629,55 @@ static void adopted_tool_cases(void) {
     if (system("rm -rf out/compatcheck-adopt") != 0) check(0, "the adopted tool fixture is removed");
 }
 
+static void custom_runner_cases(void) {
+    const char *runners = "out/compatcheck-custom";
+    const char *list = "out/compatcheck-custom.list";
+    if (system("rm -rf out/compatcheck-custom") != 0 || mkdir(runners, 0755) != 0) {
+        check(0, "the custom runner fixture can be made");
+        return;
+    }
+    static const char *const dirs[] = {
+        "wine-cx26.3", "wine-plain", "wine-nojson", "wine-", "wine-bad_name", "crossover-26.3.0.39832",
+    };
+    char p[256];
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(p, sizeof(p), "%s/%s", runners, dirs[i]);
+        mkdir(p, 0755);
+        if (strcmp(dirs[i], "wine-nojson") == 0) continue;
+        snprintf(p, sizeof(p), "%s/%s/runner.json", runners, dirs[i]);
+        put_file(p, strcmp(dirs[i], "wine-cx26.3") == 0
+                        ? "{\n  \"kind\": \"wine\",\n  \"display_name\": \"Wine 11 (CX 26.3)\"\n}\n"
+                        : "{ \"kind\": \"wine\" }\n");
+    }
+    put_file(list, "notproton-26.3\t26.3.0.39832\trosetta\tCrossOver 26.3\n"
+                   "notproton-wine-plain\twine-plain\trosetta\tListed already\n");
+
+    check(np_compat_load_tool_list(list, "/tools") == 2, "the app's tool list loads");
+    check(np_compat_load_custom_runners(runners, "/tools") == 1,
+          "only a wine-<name> folder with a runner.json and no listed tool becomes a tool");
+
+    np_compat_tool_info_t info;
+    check(np_compat_tool_by_name("notproton-wine-cx26.3", 21, &info)
+              && strcmp(info.build, "wine-cx26.3") == 0
+              && strcmp(info.display, "Wine 11 (CX 26.3)") == 0 && !info.fex,
+          "a custom runner runs under Rosetta with runner.json's display_name");
+    check(np_compat_tool_by_name("notproton-wine-plain", 20, &info)
+              && strcmp(info.display, "Listed already") == 0,
+          "a tool the list already has keeps the list's entry");
+
+    put_file("out/compatcheck-custom/wine-plain/runner.json", "{}\n");
+    check(np_compat_load_tool_list("out/compatcheck-custom-missing", "/tools") == 0
+              && np_compat_load_custom_runners(runners, "/tools") == 2
+              && np_compat_tool_by_name("notproton-wine-plain", 20, &info)
+              && strcmp(info.display, "Wine (plain)") == 0,
+          "without a tool list the custom runners still get tools, named for the folder");
+    check(np_compat_load_custom_runners("out/compatcheck-custom-none", "/tools") == 0,
+          "a missing runners folder adds nothing");
+
+    unlink(list);
+    if (system("rm -rf out/compatcheck-custom") != 0) check(0, "the custom runner fixture is removed");
+}
+
 static void tool_launch_cases(void) {
     static const char *tool[] = {
         "'/tools/compatibilitytools.d/notproton/.'/run waitforexitandrun  '/g/game.exe'",
@@ -993,6 +1042,7 @@ int main(void) {
     registration_cases();
     tool_list_cases();
     adopted_tool_cases();
+    custom_runner_cases();
     tool_launch_cases();
     stale_tool_cases();
     installed_fn_cases();

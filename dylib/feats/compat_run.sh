@@ -1,6 +1,295 @@
 #!/bin/sh
 # notproton CrossOver compatibility tool shim
 set -e
+# >>> steamplay-mac fork (custom Wine runners)
+# steamplay-mac fork: custom Wine runners (runners/wine-<name>) and AION 2's CPUID fix.
+#
+# Kept as one block here so a rebase onto a new NotProton release meets it in one place;
+# the rest of the script only carries one-line calls into it. Every function is a no-op
+# for a CrossOver build, so upstream's paths are unchanged.
+
+# A build named wine-<name> is a custom Wine runner at runners/<build> (see runner.json
+# there); anything else is a CrossOver build the app cloned to runners/crossover-<build>.
+np_custom_detect() {
+  np_runner_kind=crossover
+  case "$np_build" in wine-?*) np_runner_kind=custom ;; esac
+  [ "$np_runner_kind" = custom ] || return 0
+  [ -n "$np_display" ] || np_display="Wine (${np_build#wine-})"
+}
+
+# Variants are assembled from a CrossOver clone; a custom runner has none.
+np_custom_root() {
+  [ "${np_runner_kind-}" = custom ] || return 0
+  CX_ROOT="$np_support/runners/$np_build"
+  np_variant=""
+}
+
+# A custom runner's own dylibs (freetype, gnutls, MoltenVK, FFmpeg...) sit in its lib/.
+# np_runner_env carries that into env -i, one word either way. CrossOver's libd3dshared
+# is not the runner's: the graphics step below sets its own.
+np_custom_runner_env() {
+  np_runner_json="$CX_ROOT/runner.json"
+  np_runner_env="NOTPROTON_RUNNER_KIND=${np_runner_kind:-crossover}"
+  [ "${np_runner_kind-}" = custom ] || return 0
+  export DYLD_FALLBACK_LIBRARY_PATH="$CX_ROOT/lib:/usr/local/lib:/usr/lib"
+  np_runner_env="DYLD_FALLBACK_LIBRARY_PATH=$DYLD_FALLBACK_LIBRARY_PATH"
+  unset -v CX_APPLEGPTK_LIBD3DSHARED_PATH
+  echo "runner: custom Wine at $CX_ROOT" >> "$log" 2>&1 || true
+}
+
+# steamplay-mac's global.env: KEY=VALUE lines for every game on a custom runner, below a
+# game's own launch options and the defaults.
+np_custom_global_env() {
+  np_global_env="$np_support/global.env"
+  [ "${np_runner_kind-}" = custom ] && [ "$verb" = waitforexitandrun ] && [ -r "$np_global_env" ] \
+    || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      CX_GRAPHICS_BACKEND=*|D3DM_*=*|DXMT_*=*|DXVK_*=*|MTL_*=*|NOTPROTON_*=*|ROSETTA_*=*|WINE*=*) ;;
+      *) continue ;;
+    esac
+    key=${line%%=*}
+    case "$key" in *[!A-Za-z0-9_]*) continue ;; esac
+    eval "[ -z \"\${$key+x}\" ]" || continue
+    export "${line?}"
+    np_defaulted="$np_defaulted${np_defaulted:+ }$line"
+  done < "$np_global_env"
+}
+
+# Prefix registry lines for a custom runner, after upstream's own.
+# The Witcher 3 5.0 looks up ntdll's wine_get_version and, when it finds it, never starts
+# NVIDIA Streamline: no DLSS. wine-staging's HideWineExports (in the steamplay-mac runner)
+# makes those exports look absent. A prefix belongs to one game, so the prefix-wide value
+# reaches only it. NOTPROTON_HIDE_WINE=1 or =0 decides for any game on a custom runner.
+np_custom_settings_lines() {
+  [ "${np_runner_kind-}" = custom ] || return 0
+  hide_wine="${NOTPROTON_HIDE_WINE:-}"
+  if [ -z "$hide_wine" ]; then
+    case "$app_id" in 292030) hide_wine=1 ;; *) hide_wine=0 ;; esac
+  fi
+  echo "wine exports: hidden=$hide_wine" >> "$log" 2>&1 || true
+  if [ "$hide_wine" = 1 ]; then
+    printf '%s\r\n' '[HKEY_CURRENT_USER\Software\Wine]' '"HideWineExports"="Y"' ''
+  else
+    printf '%s\r\n' '[HKEY_CURRENT_USER\Software\Wine]' '"HideWineExports"=-' ''
+  fi
+}
+
+# Shows the custom runner's own alert when it is missing; 1 leaves CrossOver's to run.
+np_custom_missing_alert() {
+  [ "${np_runner_kind-}" = custom ] || return 1
+  show_alert "Wine runner is missing" "The Wine runner behind $(alert_safe "$np_display") is not in $(alert_safe "$CX_ROOT"). Install it again, or pick another compatibility tool for this game."
+}
+
+# A custom runner turns msync on by default when its runner.json says "msync": true.
+np_custom_msync_default() {
+  [ "${np_runner_kind-}" = custom ] && [ -z "${WINEMSYNC-}" ] || return 0
+  if grep -q '"msync"[[:space:]]*:[[:space:]]*true' "$np_runner_json" 2>/dev/null; then
+    WINEMSYNC=1
+  fi
+}
+
+# A custom runner routes steamclient to lsteamclient in its own ntdll, so there is no
+# patched ntdll to compare; only its lsteamclient is checked. 1 leaves verify_runner to run.
+np_custom_verify_runner() {
+  [ "${np_runner_kind-}" = custom ] || return 1
+  for arch in i386-windows x86_64-windows "${wine_unix##*/}"; do
+    case "$arch" in
+      *-unix) name="lsteamclient.so" ;;
+      *) name="lsteamclient.dll" ;;
+    esac
+    [ -f "$CX_ROOT/lib/wine/$arch/$name" ] && continue
+    echo "=== runner is missing $arch/$name, set up the runner again ===" >> "$log" 2>&1 || true
+  done
+}
+
+# A custom runner that carries its own lsteamclient and steam.exe (built against its own
+# Wine) has them staged instead of the app's, which are built for CrossOver.
+bridge_file_src() {
+  if [ "${np_runner_kind-}" = custom ]; then
+    case "$1" in
+      lsteamclient.dll | x86_64-windows/lsteamclient.dll) set -- "$1" "$CX_ROOT/lib/wine/x86_64-windows/lsteamclient.dll" ;;
+      i386-windows/lsteamclient.dll) set -- "$1" "$CX_ROOT/lib/wine/i386-windows/lsteamclient.dll" ;;
+      x86_64-unix/lsteamclient.so) set -- "$1" "$CX_ROOT/lib/wine/x86_64-unix/lsteamclient.so" ;;
+      steam.exe) set -- "$1" "$CX_ROOT/share/steamplay/steam.exe" ;;
+    esac
+    if [ -n "${2-}" ] && [ -f "$2" ]; then printf '%s' "$2"; return; fi
+  fi
+  printf '%s' "$bridge_src/$1"
+}
+
+# The source of bridge file $1 as the staging loop names it (lsteamclient.so sits under
+# the unix arch).
+np_custom_bridge_src() {
+  case "$1" in
+    lsteamclient.so) bridge_file_src "${wine_unix##*/}/$1" ;;
+    *) bridge_file_src "$1" ;;
+  esac
+}
+
+# Graphics backend on a custom runner. CrossOver's wine picks one itself from
+# CX_GRAPHICS_BACKEND; a custom runner has the renderers as overlays in lib/renderers/<name>
+# that WINEDLLPATH_PREPEND puts ahead of Wine's own DLLs. CX_GRAPHICS_BACKEND (the panel's
+# setting or a launch option) wins; without it the game's binaries decide: Direct3D 12 ->
+# D3DMetal, Direct3D 10/11 -> DXMT, anything else -> wined3d.
+detect_d3d() {
+  pe_d3d="$np_support/pe-d3d"
+  [ -x "$pe_d3d" ] && [ -d "$STEAM_COMPAT_INSTALL_PATH" ] || { echo none; return; }
+  # A game that ships Microsoft's D3D12 Agility SDK renders with Direct3D 12.
+  if find "$STEAM_COMPAT_INSTALL_PATH" -maxdepth 6 -ipath '*/D3D12/D3D12Core.dll' 2>/dev/null | grep -q .; then
+    echo "  hint: bundled D3D12 Agility SDK" >> "$log" 2>&1 || true
+    echo d3d12
+    return
+  fi
+  # The launch target plus the largest executables (a launcher stub often fronts the
+  # real *-Shipping.exe), and the engine DLLs that do the rendering (Unity, CryEngine...).
+  candidates=$(
+    { [ -f "$1" ] && printf '%s\n' "$1"
+      find "$STEAM_COMPAT_INSTALL_PATH" -maxdepth 6 -type f \( -iname '*.exe' -o -iname 'UnityPlayer.dll' \
+          -o -iname '*render*.dll' -o -iname '*d3d1[12]*.dll' -o -iname 'CryRenderD3D*.dll' \) -size +200k 2>/dev/null \
+        | grep -viE '/(_commonredist|commonredist|redist|redistributables|directx|vcredist|dotnet|support|easyanticheat|battleye|__installer|installers?|crashreport[a-z]*)/' \
+        | grep -viE '/d3d12/(d3d12core|d3d12sdklayers)\.dll$' \
+        | while IFS= read -r f; do printf '%s\t%s\n' "$(stat -f %z "$f")" "$f"; done \
+        | sort -rn | head -12 | cut -f2-
+    } | awk '!seen[$0]++')
+  [ -n "$candidates" ] || { echo none; return; }
+  scan=$(printf '%s\n' "$candidates" | tr '\n' '\0' | xargs -0 "$pe_d3d" 2>/dev/null)
+  printf '%s\n' "$scan" | sed 's/^/  pe-d3d: /' >> "$log" 2>&1 || true
+  flags=$(printf '%s\n' "$scan" | cut -d' ' -f1 | tr ',\n' '  ')
+  # Engines that load their renderer at run time (Unreal Engine 5 among them) import no
+  # Direct3D DLL at all; the names of the runtimes in the largest binary are the best hint.
+  case " $flags " in
+    *" d3d"*|*" dxgi:"*|*" ddraw:"*|*" opengl:"*|*" vulkan:"*) ;;
+    *)
+      big=$(printf '%s\n' "$candidates" | while IFS= read -r f; do printf '%s\t%s\n' "$(stat -f %z "$f")" "$f"; done \
+        | sort -rn | head -1 | cut -f2-)
+      if [ -f "$big" ]; then
+        if LC_ALL=C grep -a -q -i 'd3d12\.dll' "$big"; then flags="$flags d3d12:d"
+        elif LC_ALL=C grep -a -q -i 'd3d11\.dll' "$big"; then flags="$flags d3d11:d"
+        elif LC_ALL=C grep -a -q -i 'd3d9\.dll' "$big"; then flags="$flags d3d9:d"
+        fi
+        echo "  hint: runtime names in $(basename "$big"): $flags" >> "$log" 2>&1 || true
+      fi
+      ;;
+  esac
+  case " $flags " in
+    *" d3d12:i "*) echo d3d12 ;;
+    *" d3d11:i "*|*" dxgi:i "*|*" d3d10:i "*) echo d3d11 ;;
+    *" d3d12:d "*) echo d3d12 ;;
+    *" d3d11:d "*|*" dxgi:d "*|*" d3d10:d "*) echo d3d11 ;;
+    *" d3d9:"*|*" d3d8:"*|*" ddraw:"*) echo d3d9 ;;
+    *" opengl:"*) echo opengl ;;
+    *" vulkan:"*) echo vulkan ;;
+    *) echo none ;;
+  esac
+}
+
+# $1 is the launch target, for detect_d3d.
+np_custom_graphics() {
+  backend_label=""
+  [ "${np_runner_kind-}" = custom ] || return 0
+  backend="${CX_GRAPHICS_BACKEND:-auto}"
+  backend_from=launch-options
+  if np_from_defaults CX_GRAPHICS_BACKEND; then backend_from=${np_defaults_file##*/}; fi
+  if [ "$backend" = auto ]; then
+    api=$(detect_d3d "$1")
+    case "$api" in
+      d3d12) backend=d3dmetal ;;
+      # The D3DMetal 4 row is a request for D3DMetal, so it wins over DXMT for D3D11 too.
+      d3d11) if [ "${NOTPROTON_D3DMETAL4:-0}" = 1 ]; then backend=d3dmetal; else backend=dxmt; fi ;;
+      *) backend=wined3d ;;
+    esac
+    backend_from="auto ($api)"
+  fi
+  # A renderer the runner does not carry falls back to wined3d.
+  [ "$backend" = wined3d ] || [ "$backend" = d3dmetal4 ] || [ -d "$CX_ROOT/lib/renderers/$backend" ] || {
+    echo "=== no $backend in this runner, using wined3d ===" >> "$log" 2>&1 || true
+    backend=wined3d
+  }
+  # D3DMetal 4 (Game Porting Toolkit 4) sits next to D3DMetal 3 and needs macOS 27. Wine
+  # compares CX_ACTIVE_GRAPHICS_BACKEND with "d3dmetal", so both run under that name and
+  # only the directories differ. NOTPROTON_D3DMETAL4=1 (a plugin row) asks for it as well.
+  [ "$backend" != d3dmetal ] || [ "${NOTPROTON_D3DMETAL4:-0}" != 1 ] || backend=d3dmetal4
+  d3dm=d3dmetal
+  d3dm_lib="$CX_ROOT/lib/external/libd3dshared.dylib"
+  if [ "$backend" = d3dmetal4 ]; then
+    backend=d3dmetal
+    macos=$(sw_vers -productVersion 2>/dev/null || true)
+    macos_major=${macos%%.*}
+    case "$macos_major" in ''|*[!0-9]*) macos_major=0 ;; esac
+    if [ ! -f "$CX_ROOT/lib/external/d3dmetal4/libd3dshared.dylib" ] || [ ! -d "$CX_ROOT/lib/renderers/d3dmetal4" ]; then
+      echo "=== no D3DMetal 4 in this runner, using D3DMetal 3 ===" >> "$log" 2>&1 || true
+    elif [ "$macos_major" -lt 27 ]; then
+      echo "=== D3DMetal 4 needs macOS 27 (this is $macos), using D3DMetal 3 ===" >> "$log" 2>&1 || true
+    else
+      d3dm=d3dmetal4
+      d3dm_lib="$CX_ROOT/lib/external/d3dmetal4/libd3dshared.dylib"
+      # The Metal 4 path of the 4.0 beta ends some games within a minute without a word,
+      # so it stays off unless a game asks for it.
+      export D3DM_MTL4="${D3DM_MTL4:-${NOTPROTON_ENV_D3DM_MTL4:-0}}"
+    fi
+  fi
+  case "$backend" in
+    d3dmetal)
+      export WINEDLLPATH_PREPEND="$CX_ROOT/lib/renderers/$d3dm"
+      export CX_APPLEGPTK_LIBD3DSHARED_PATH="$d3dm_lib"
+      # Apple's GPTK Read Me: DLSS -> MetalFX also needs D3DMetal's nvngx.dll and nvapi64.dll
+      # in the prefix's system32, which otherwise holds Wine's placeholders. NGX inside the
+      # game loads _nvngx.dll from there first and turns down the unsigned placeholder, so
+      # without them Streamline unloads DLSS. D3DMetal 3 and 4 differ, so the copies follow.
+      ngx_src="$CX_ROOT/lib/renderers/$d3dm/x86_64-windows"
+      ngx_dst="$WINEPREFIX/drive_c/windows/system32"
+      for ngx_dll in nvngx.dll _nvngx.dll nvapi64.dll; do
+        [ -f "$ngx_src/$ngx_dll" ] && [ -d "$ngx_dst" ] || continue
+        cmp -s "$ngx_src/$ngx_dll" "$ngx_dst/$ngx_dll" ||
+          cp -f "$ngx_src/$ngx_dll" "$ngx_dst/$ngx_dll" >> "$log" 2>&1 || true
+      done
+      ;;
+    dxmt | dxvk)
+      export WINEDLLPATH_PREPEND="$CX_ROOT/lib/renderers/$backend"
+      ;;
+    *) backend=wined3d ;;
+  esac
+  export CX_ACTIVE_GRAPHICS_BACKEND="$backend"
+  backend_label="$backend"
+  [ "$backend" = d3dmetal ] && [ "$d3dm" = d3dmetal4 ] && backend_label="d3dmetal 4 (MTL4=$D3DM_MTL4)"
+  echo "graphics: $backend_label from $backend_from" >> "$log" 2>&1 || true
+}
+
+# Apple's Metal Performance HUD: when it is on and nothing else is configured, keep it small
+# in the top-right corner. Below it, syshud adds what Metal cannot show (CPU/GPU load, RAM,
+# OS, runner, backend); NOTPROTON_SYSHUD=0 leaves it out.
+np_custom_hud() {
+  [ "${MTL_HUD_ENABLED:-0}" = 1 ] && [ "${np_runner_kind-}" = custom ] || return 0
+  export MTL_HUD_ALIGNMENT="${MTL_HUD_ALIGNMENT:-topright}"
+  export MTL_HUD_SCALE="${MTL_HUD_SCALE:-0.12}"
+  export MTL_HUD_OPACITY="${MTL_HUD_OPACITY:-0.85}"
+  export MTL_HUD_ELEMENTS="${MTL_HUD_ELEMENTS:-fps,frameinterval,gputime,presentdelay,layersize,memory,fpsgraph}"
+  echo "hud: $MTL_HUD_ALIGNMENT scale=$MTL_HUD_SCALE elements=$MTL_HUD_ELEMENTS" >> "$log" 2>&1 || true
+  syshud="$np_support/syshud"
+  if [ "${NOTPROTON_SYSHUD:-1}" = 1 ] && [ -x "$syshud" ] && [ "$verb" = waitforexitandrun ]; then
+    rows=$(printf '%s' "$MTL_HUD_ELEMENTS" | tr ',' '\n' | grep -c .)
+    case ",$MTL_HUD_ELEMENTS," in *graph*|*histogram*) rows=$((rows + 3)) ;; esac
+    wine_label="$(sed -n 's/.*"wine"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$np_runner_json" 2>/dev/null) ($np_build)"
+    "$syshud" --offset "${NOTPROTON_SYSHUD_OFFSET:-$((14 + rows * 14))}" \
+      --label "Wine: $wine_label" --label "Graphics: ${backend_label:-?} (Rosetta)" \
+      --pid $$ --app "com.notproton.launcher.$app_id" >> "$log" 2>&1 &
+  fi
+}
+
+# AION 2: NC Guard's start-up CPUID trampoline switches to 32-bit code, which Rosetta does
+# not run. gamefixes/aion2 (aion2-wine-compat) emulates it from Wine's signal handlers. It
+# rides on the overlay's insert list, ahead of it; NOTPROTON_AION2_COMPAT=0 leaves it out.
+# Applies to any runner, CrossOver included.
+np_aion2_compat() {
+  aion2_compat="$np_support/aion2-compat/compat_cpuid.dylib"
+  if [ "$app_id" = 3393110 ] && [ "${NOTPROTON_AION2_COMPAT:-1}" != 0 ] && [ -f "$aion2_compat" ] \
+     && [ "${wine_unix##*/}" = x86_64-unix ]; then
+    np_feat_dylibs="$aion2_compat${np_feat_dylibs:+:$np_feat_dylibs}"
+    echo "=== aion2-wine-compat inserted ===" >> "$log" 2>&1 || true
+  fi
+}
+# <<< steamplay-mac fork
 
 verb="$1"
 shift || true
@@ -345,6 +634,7 @@ fi
 case "$np_build" in *[!A-Za-z0-9.-]*) np_build="" ;; esac
 np_display=$(sed -n 's/.*"display_name"[[:space:]]*"\(.*\)".*/\1/p' \
   "$np_tool_dir/compatibilitytool.vdf" 2>/dev/null | head -1) || np_display=""
+np_custom_detect
 [ -n "$np_display" ] || np_display="CrossOver build ${np_build:-unknown}"
 if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   log="$STEAM_COMPAT_DATA_PATH/notproton-run.log"
@@ -1162,6 +1452,7 @@ np_variant=${NOTPROTON_RUNNER_VARIANT:-}
 np_variant_key=""
 np_variant_layout=""
 case "$np_variant" in *[!A-Za-z0-9._+-]*) np_variant="" ;; esac
+[ "${np_runner_kind-}" != custom ] || np_custom_root
 if [ -n "$np_variant" ]; then
   if np_variant_resolve "$np_variant"; then
     CX_ROOT="$np_variant_root"
@@ -1177,6 +1468,7 @@ export CX_ROOT
 if [ -f "$CX_ROOT/lib64/apple_gptk/external/libd3dshared.dylib" ]; then
   export CX_APPLEGPTK_LIBD3DSHARED_PATH="$CX_ROOT/lib64/apple_gptk/external/libd3dshared.dylib"
 fi
+[ "${np_runner_kind-}" != custom ] || np_custom_runner_env
 
 wine_unix="$CX_ROOT/lib/wine/aarch64-unix"
 WINELOADER="$wine_unix/wine.app/Contents/MacOS/wine"
@@ -1266,6 +1558,7 @@ if [ "$verb" = waitforexitandrun ] && [ -f "$np_defaults_file" ] && [ -r "$np_de
     np_defaulted="$np_defaulted${np_defaulted:+ }$line"
   done < "$np_defaults_file"
 fi
+[ "${np_runner_kind-}" != custom ] || np_custom_global_env
 [ "${CX_GRAPHICS_BACKEND-}" != auto ] || unset -v CX_GRAPHICS_BACKEND
 
 np_dropped=""
@@ -2091,7 +2384,7 @@ import_prefix_settings() {
       '[HKEY_LOCAL_MACHINE\Software\Classes\steam\shell\open\command]' \
       '@="\"C:\\Program Files (x86)\\Steam\\steam.exe\" \"%1\""' '' \
       && hidraw_lines add "$controllers_add" && hidraw_lines remove "$controllers_remove" \
-      && winebus_lines; } \
+      && winebus_lines && { [ "${np_runner_kind-}" != custom ] || np_custom_settings_lines; }; } \
       > "$settings_file" 2>/dev/null; then
     [ -z "$settings_file" ] || rm -f "$settings_file"
     echo "=== could not write the prefix settings, launching without them ===" >> "$log" 2>&1 || true
@@ -2137,7 +2430,7 @@ import_prefix_settings() {
 stage_step="runner check"
 if [ -z "$np_build" ] || [ ! -d "$CX_ROOT/lib/wine" ]; then
   echo "=== build ${np_build:-(none recorded)} behind this compatibility tool is not set up, set it up in NotProton ===" >> "$log" 2>&1 || true
-  show_alert "CrossOver is not set up" "The CrossOver build behind $(alert_safe "$np_display") is not set up. Set it up in NotProton, or pick another compatibility tool for this game."
+  { [ "${np_runner_kind-}" = custom ] && np_custom_missing_alert; } || show_alert "CrossOver is not set up" "The CrossOver build behind $(alert_safe "$np_display") is not set up. Set it up in NotProton, or pick another compatibility tool for this game."
   exit 1
 fi
 echo "runner: build $np_build ($np_display) at $CX_ROOT" >> "$log" 2>&1 || true
@@ -2163,6 +2456,7 @@ in_template_env() {
     env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" \
     LANG="${LANG:-}" LC_ALL="${LC_ALL:-}" \
     PATH="$CX_ROOT/bin:/usr/bin:/bin:/usr/sbin:/sbin" CX_ROOT="$CX_ROOT" CX_HOME="$CX_HOME" \
+    "${np_runner_env:-NOTPROTON_RUNNER_KIND=crossover}" \
     WINEDLLPATH="$CX_ROOT/lib/wine/x86_64-windows:$wine_unix" \
     WINELOADER="$WINELOADER" WINESERVER="$WINESERVER" WINEPREFIX="$prefix" "$@"
 }
@@ -2599,6 +2893,7 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
     msync_from=carried-over
   fi
   [ -n "$WINEMSYNC" ] || msync_from=default
+  [ "${np_runner_kind-}" != custom ] || np_custom_msync_default
   export WINEMSYNC="${WINEMSYNC:-0}"
   printf '%s' "$WINEMSYNC" \
     > "$STEAM_COMPAT_DATA_PATH/notproton-msync" 2>/dev/null || true
@@ -2642,6 +2937,7 @@ fi
 bridge_src="$np_support/bridge"
 prefix_steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
 verify_runner() {
+  [ "${np_runner_kind-}" != custom ] || { np_custom_verify_runner; return 0; }
   if [ ! -d "$bridge_src/wine/$np_build" ]; then
     echo "=== no patched ntdll for build $np_build in the bridge, set it up in NotProton ===" >> "$log" 2>&1 || true
     return
@@ -2667,6 +2963,7 @@ verify_runner() {
 }
 install_lsteamclient_trigger() {
   src="$bridge_src/i386-windows/lsteamclient.dll"
+  [ "${np_runner_kind-}" != custom ] || src=$(bridge_file_src i386-windows/lsteamclient.dll)
   dst="$WINEPREFIX/drive_c/windows/syswow64/lsteamclient.dll"
   [ -f "$src" ] && [ -d "$WINEPREFIX/drive_c/windows/syswow64" ] || return 0
   cmp -s "$src" "$dst" && return 0
@@ -2732,6 +3029,8 @@ bridge_files="$bridge_files lsteamclient.dll lsteamclient.so steam.exe"
 # bridge kept beside that drive's templates.
 bridge_origin() {
   origin="$bridge_src/$1"
+  [ "${np_runner_kind-}" != custom ] || origin=$(bridge_file_src "$1")
+  bridge_from="$origin"
   [ -n "$bridge_cache" ] || return 0
   cached="$bridge_cache/$1"
   for d in "${bridge_cache%/*}" "$bridge_cache" "${cached%/*}"; do
@@ -2748,7 +3047,7 @@ bridge_origin() {
 }
 place_bridge_file() {
   bridge_origin "$1"
-  cp -c -fp "$origin" "$2" 2>/dev/null || cp -fp "$bridge_src/$1" "$2" 2>> "$log"
+  cp -c -fp "$origin" "$2" 2>/dev/null || cp -fp "$bridge_from" "$2" 2>> "$log"
 }
 if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
   stage_step="bridge staging"
@@ -2764,6 +3063,7 @@ if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
     if [ "$f" = lsteamclient.so ]; then
       src="$bridge_src/${wine_unix##*/}/$f"
     fi
+    [ "${np_runner_kind-}" != custom ] || src=$(np_custom_bridge_src "$f")
     if ! cmp -s "$src" "$prefix_steam/$f"; then
       bridge_matches=0
       break
@@ -2779,6 +3079,7 @@ if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
         rel="${wine_unix##*/}/$f"
       fi
       src="$bridge_src/$rel"
+      [ "${np_runner_kind-}" != custom ] || src=$(bridge_file_src "$rel")
       if [ ! -f "$src" ]; then
         echo "=== bridge missing $f ===" >> "$log" 2>&1 || true
         continue
@@ -2827,6 +3128,8 @@ if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
   echo "STEAM_COMPAT_CLIENT_INSTALL_PATH=$STEAM_COMPAT_CLIENT_INSTALL_PATH" >> "$log" 2>&1 || true
 fi
 
+[ "${np_runner_kind-}" != custom ] || np_custom_graphics "$1"
+[ "${np_runner_kind-}" != custom ] || np_custom_hud
 export WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}"
 exec 8>&-
 printf 'launch_args=%s\n' "$launch_args" >> "$log" 2>&1 || true
@@ -2959,6 +3262,7 @@ if [ -z "$game_runner" ]; then
 #!/bin/sh
 $(np_handoff "$steam_url")
 export WINELOADER="$WINELOADER"
+${DYLD_FALLBACK_LIBRARY_PATH:+export DYLD_FALLBACK_LIBRARY_PATH="$DYLD_FALLBACK_LIBRARY_PATH"}
 wine_log="$loader_root/notproton-wine.log"
 exec > "\$wine_log" 2>&1
 shim="$HOME/Library/Application Support/notproton/overlay-shim.dylib"
@@ -3322,6 +3626,7 @@ done <<NP_FEAT_LIST
 $np_feat_list
 NP_FEAT_LIST
 
+[ "$app_id" != 3393110 ] || np_aion2_compat
 game_cwd="$(pwd)"
 if [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ]; then
   echo "=== overlay injected from $STEAM_DYLD_INSERT_LIBRARIES ===" >> "$log" 2>&1 || true
@@ -3432,7 +3737,7 @@ NP_FEAT_ENVS
     eval "value=\$NOTPROTON_ENV_$name"
     set -- --env "$name=$value" "$@"
   done
-  for name in $(env | LC_ALL=C sed -nE 's/^(CX_APPLEGPTK_LIBD3DSHARED_PATH|Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|FEX_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
+  for name in $(env | LC_ALL=C sed -nE 's/^(CX_APPLEGPTK_LIBD3DSHARED_PATH|CX_ACTIVE_GRAPHICS_BACKEND|WINEDLLPATH_PREPEND|DYLD_FALLBACK_LIBRARY_PATH|Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|FEX_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
     eval "value=\$$name"
     # shellcheck disable=SC2154 # eval assigns value on the line above
     set -- --env "$name=$value" "$@"
